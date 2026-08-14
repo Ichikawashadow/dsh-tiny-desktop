@@ -1,0 +1,8 @@
+# 构建产物
+DSH Tray.exe
+*.exe
+rsrc.syso
+
+# 系统文件
+Thumbs.db
+.DS_Store
