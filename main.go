@@ -75,6 +75,40 @@ const zoomScript = `
 })();
 `
 
+// 外部链接拦截脚本：DSH 对话中的网页链接（非本服务域名）一律交给 Edge 打开
+const externalScript = `
+(function () {
+  if (window.__dshExternalInstalled) return;
+  window.__dshExternalInstalled = true;
+  function isExternal(href) {
+    if (!href || typeof href !== 'string') return false;
+    if (href.indexOf('http:') !== 0 && href.indexOf('https:') !== 0) return false;
+    var origin = window.location.origin;
+    return href.indexOf(origin) !== 0;
+  }
+  document.addEventListener('click', function (e) {
+    var el = e.target;
+    while (el && el !== document) {
+      if (el.tagName === 'A' && isExternal(el.href)) {
+        e.preventDefault();
+        e.stopPropagation();
+        window.__dshOpenExternal && window.__dshOpenExternal(el.href);
+        return;
+      }
+      el = el.parentElement;
+    }
+  }, true);
+  var origOpen = window.open;
+  window.open = function (u) {
+    if (u && typeof u === 'string' && isExternal(u)) {
+      window.__dshOpenExternal && window.__dshOpenExternal(u);
+      return null;
+    }
+    return origOpen.apply(this, arguments);
+  };
+})();
+`
+
 const (
 	swHide = 0
 	swShow = 5
@@ -267,6 +301,10 @@ func runWebview() {
 	}
 	w.SetTitle("DeepSeek Harness")
 	w.SetSize(1280, 800, webview.HintNone)
+	// 外部链接回调：DSH 对话中的网页链接 → Edge 打开
+	w.Bind("__dshOpenExternal", func(url string) {
+		openEdge(url)
+	})
 
 	h := uintptr(w.Window())
 	wvMu.Lock()
@@ -290,12 +328,12 @@ func runWebview() {
 			time.Sleep(500 * time.Millisecond)
 		}
 		w.Dispatch(func() { w.Navigate(webURL) })
-		// 注入缩放脚本（页面加载后）
+		// 注入缩放脚本 + 外部链接拦截脚本（页面加载后）
 		time.Sleep(2500 * time.Millisecond)
 		if exiting {
 			return
 		}
-		w.Dispatch(func() { w.Eval(zoomScript) })
+		w.Dispatch(func() { w.Eval(zoomScript + externalScript) })
 	}()
 
 	w.Run() // 消息循环，窗口关闭后返回
@@ -323,7 +361,7 @@ func showWindow() {
 	showWin(h, swShow)
 	procSetForegroundWindow.Call(h)
 	if w != nil {
-		w.Dispatch(func() { w.Eval(zoomScript) })
+		w.Dispatch(func() { w.Eval(zoomScript + externalScript) })
 	}
 	Log("显示窗口")
 }
@@ -385,10 +423,28 @@ func restartService() {
 	startDsh()
 }
 
-// ---------- 浏览器 ----------
+// ---------- 浏览器（默认使用 Microsoft Edge） ----------
 func openBrowser() {
-	Log("打开浏览器 " + webURL)
-	exec.Command("rundll32", "url.dll,FileProtocolHandler", webURL).Start()
+	openEdge(webURL)
+}
+
+// 用 Edge 打开链接（避免系统默认浏览器；找不到 Edge 时回退系统默认）
+func openEdge(url string) {
+	Log("Edge 打开: " + url)
+	paths := []string{
+		`C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`,
+		`C:\Program Files\Microsoft\Edge\Application\msedge.exe`,
+	}
+	for _, p := range paths {
+		if _, err := os.Stat(p); err == nil {
+			exec.Command(p, url).Start()
+			return
+		}
+	}
+	// 兜底：start msedge（App Paths 解析）
+	cmd := exec.Command("cmd", "/c", "start", "", "msedge", url)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
+	cmd.Start()
 }
 
 // ---------- 路径解析 ----------
