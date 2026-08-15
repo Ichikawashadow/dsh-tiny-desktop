@@ -81,6 +81,15 @@ Go binary (single exe)
 └── win32 interop             — DPI awareness, singleton mutex, window icon
 ```
 
+## 🌱 Ecosystem positioning
+
+dsh-tiny-desktop is **complementary to, not competing with**, the DSH plugin ecosystem:
+
+- **This shell**: a standalone desktop client (single Go binary) that handles the desktop experience of the DSH service — tray resident, native window, service lifecycle. It does **not** modify your DSH profile;
+- **DSH plugins**: cordis plugins that run *inside* the DSH Web GUI (skins, stats, tool integrations…), installed via the [`dsh-plugin`](https://github.com/topics/dsh-plugin) topic or plugin marketplaces.
+
+Either can be used without the other: DSH and its plugins work fine without this shell, and this shell works fine alongside any plugins.
+
 ## ⚠️ Disclaimer
 
 This is an **independent community project**, not affiliated with or endorsed by DeepSeek. DeepSeek Harness itself is developed by DeepSeek AI and licensed under MIT.

@@ -81,6 +81,15 @@ Go 单文件程序
 └── win32 互操作              — DPI 感知、单例互斥、窗口图标
 ```
 
+## 🌱 生态定位
+
+dsh-tiny-desktop 与 DSH 插件体系**互补而非冲突**：
+
+- **本壳**：独立桌面客户端（Go 单文件），负责 DSH 服务的桌面体验——托盘驻留、原生窗口、服务生命周期管理，不修改你的 DSH profile；
+- **DSH 插件**：运行在 DSH Web GUI 内部的 cordis 插件（皮肤、统计、工具集成等），通过 [`dsh-plugin`](https://github.com/topics/dsh-plugin) topic 或插件市场安装。
+
+两者互不依赖：不用本壳也可以照常使用 DSH 及其插件；本壳也可以与任意插件组合使用。
+
 ## ⚠️ 免责声明
 
 本项目是**独立社区项目**，与 DeepSeek 官方无关、未获其背书。DeepSeek Harness 本身由 DeepSeek AI 开发，采用 MIT 协议。
