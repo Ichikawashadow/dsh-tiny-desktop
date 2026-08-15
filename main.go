@@ -13,6 +13,7 @@ package main
 
 import (
 	_ "embed"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"os"
@@ -198,21 +199,72 @@ func showWin(h uintptr, cmd int) {
 	}
 }
 
-// 设置窗口标题栏图标（从嵌入的 ICO 数据创建 HICON，无需外部文件）
+// 设置窗口标题栏/任务栏图标（从嵌入 ICO 中提取单图像创建 HICON，无需外部文件）
 func setWindowIcon(h uintptr) {
 	if h == 0 || len(icoBytes) == 0 {
 		return
 	}
-	p := unsafe.Pointer(&icoBytes[0])
-	// CreateIconFromResourceEx: (pResBits, dwResSize, fIcon=TRUE, dwVer=0x30000, cx, cy, flags=0)
-	big, _, _ := procCreateIconFromRes.Call(uintptr(p), uintptr(len(icoBytes)), 1, 0x00030000, 32, 32, 0)
-	small, _, _ := procCreateIconFromRes.Call(uintptr(p), uintptr(len(icoBytes)), 1, 0x00030000, 16, 16, 0)
+	big := iconFromIco(icoBytes, 32, 32)
+	small := iconFromIco(icoBytes, 16, 16)
+	Log("窗口图标: big=0x" + fmt.Sprintf("%X", big) + " small=0x" + fmt.Sprintf("%X", small))
 	if big != 0 {
 		procSendMessage.Call(h, wmSetIcon, iconBig, big)
 	}
 	if small != 0 {
 		procSendMessage.Call(h, wmSetIcon, iconSmall, small)
 	}
+}
+
+// 从 ICO 文件字节中提取最接近目标尺寸的单图像，创建 HICON
+// （CreateIconFromResourceEx 需要 ICONDIRENTRY 内的图像数据，而非完整 ICO 文件）
+func iconFromIco(data []byte, wantW, wantH int) uintptr {
+	if len(data) < 6 {
+		return 0
+	}
+	count := int(binary.LittleEndian.Uint16(data[4:6]))
+	if len(data) < 6+count*16 {
+		return 0
+	}
+	best := -1
+	bestScore := int(^uint(0) >> 1)
+	for i := 0; i < count; i++ {
+		off := 6 + i*16
+		w := int(data[off])
+		if w == 0 {
+			w = 256
+		}
+		h := int(data[off+1])
+		if h == 0 {
+			h = 256
+		}
+		size := int(binary.LittleEndian.Uint32(data[off+8:]))
+		imgOff := int(binary.LittleEndian.Uint32(data[off+12:]))
+		if imgOff+size > len(data) || size <= 0 {
+			continue
+		}
+		score := abs(w-wantW) + abs(h-wantH)
+		if score < bestScore {
+			bestScore = score
+			best = i
+		}
+	}
+	if best < 0 {
+		return 0
+	}
+	off := 6 + best*16
+	size := int(binary.LittleEndian.Uint32(data[off+8:]))
+	imgOff := int(binary.LittleEndian.Uint32(data[off+12:]))
+	p := unsafe.Pointer(&data[imgOff])
+	// CreateIconFromResourceEx(pResBits, dwResSize, fIcon=TRUE, dwVer=0x30000, cx=0, cy=0, flags=0)
+	r, _, _ := procCreateIconFromRes.Call(uintptr(p), uintptr(size), 1, 0x00030000, 0, 0, 0)
+	return r
+}
+
+func abs(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
 }
 
 func main() {
