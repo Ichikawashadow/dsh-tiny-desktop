@@ -8,12 +8,14 @@
 //   - 关窗即销毁窗口（释放 WebView2 内存约 500MB），再次打开自动重建
 //   - 单例保护：重复启动仅聚焦已有窗口
 //   - 内核永远跟随 npx 最新版 @deepseek-ai/dsh
+//
 // 日志：%USERPROFILE%\.dsh\logs\dsh-web.log
 package main
 
 import (
 	_ "embed"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -28,6 +30,7 @@ import (
 
 	"github.com/getlantern/systray"
 	webview "github.com/jchv/go-webview2"
+	"golang.org/x/sys/windows"
 )
 
 // 图标嵌入 exe（单文件部署，无需外部资源）
@@ -39,6 +42,160 @@ const (
 	port   = 3080
 	webURL = "http://127.0.0.1:3080"
 )
+
+// 页面通知桥：把 WebView2 里的 Notification API 换成 shim，
+// 权限恒为 granted，new Notification(...) 转发给 Go 原生浮窗；
+// 并挂载授权桥：订阅 DSH 客户端运行时（composer 槽）的 pending 授权请求，
+// 推送带「允许一次/拒绝」按钮的通知，按钮结果经 window.__dshRespond 回传应答。
+// 不依赖 WebView2 的 PermissionRequested（宿主不处理默认拒绝），
+// 也不受"非打包应用需 AUMID 才显示通知"的限制；在真浏览器中打开时不受影响。
+const notifyShimScript = `
+(function () {
+  if (window.__dshNotifyShimInstalled) return;
+  window.__dshNotifyShimInstalled = true;
+  var Real = window.Notification;
+  function route(nt) {
+    try {
+      if (window.__dshNativeNotify) {
+        var p = window.__dshNativeNotify({
+          title: String(nt.title || ''),
+          body: String(nt.body || ''),
+          tag: String(nt.tag || ''),
+          requireInteraction: !!nt.requireInteraction
+        });
+        if (p && typeof p.catch === 'function') p.catch(function () {});
+      } else if (Real) {
+        new Real(nt.title, { body: nt.body, tag: nt.tag, requireInteraction: nt.requireInteraction });
+      }
+    } catch (e) {}
+  }
+  function Shim(title, options) {
+    if (!(this instanceof Shim)) return new Shim(title, options);
+    this.title = title;
+    this.body = (options && options.body) || '';
+    this.tag = (options && options.tag) || '';
+    this.requireInteraction = !!(options && options.requireInteraction);
+    this.onclick = null;
+    this.onshow = null;
+    this.onerror = null;
+    this.onclose = null;
+    this.timestamp = Date.now();
+    var self = this;
+    route(this);
+    try {
+      if (typeof queueMicrotask === 'function') queueMicrotask(function () {
+        if (self.onshow) self.onshow.call(self, { type: 'show' });
+      });
+    } catch (e) {}
+  }
+  Shim.permission = 'granted';
+  Shim.requestPermission = function () { return Promise.resolve('granted'); };
+  Shim.maxActions = 0;
+  Shim.prototype.close = function () {};
+  try {
+    Object.defineProperty(window, 'Notification', { value: Shim, writable: true, configurable: true });
+  } catch (e) {
+    window.Notification = Shim;
+  }
+
+  // ---------- 授权桥（approval bridge） ----------
+  // 订阅客户端运行时 composer 槽的 pending 授权，推到通知浮窗；
+  // 浮窗按钮点击后 Go 侧 Eval 调用 window.__dshRespond 完成应答。
+  var waits = {};      // pending key -> PendingWait
+  var current = null;  // 当前已推送的授权 key
+  function push(wait) {
+    try {
+      waits[wait.key] = wait;
+      if (current === wait.key) return;
+      current = wait.key;
+      var p = wait.payload || {};
+      var reason = p.reason || (p.toolName ? ('工具 ' + p.toolName + ' 需要授权') : 'DSH 请求授权');
+      var pr = window.__dshNativeNotify({
+        title: '需要授权',
+        body: String(reason || ''),
+        tag: 'approval:' + wait.key,
+        requireInteraction: true,
+        actions: [{ id: 'allowed-once', label: '允许一次' }, { id: 'rejected', label: '拒绝' }],
+        ref: wait.key
+      });
+      if (pr && typeof pr.catch === 'function') pr.catch(function () {});
+    } catch (e) {}
+  }
+  function drop(key) {
+    try { delete waits[key]; } catch (e) {}
+    if (current === key) current = null;
+  }
+  function respond(ref, action) {
+    var wait = waits[ref];
+    if (!wait) return;
+    drop(ref);
+    var p = wait.payload || {};
+    var outcome = (action === 'allowed-once' || action === 'rejected') ? action : 'rejected';
+    Promise.resolve().then(function () {
+      wait.respond({ ok: true, value: { sessionId: wait.sessionId, approvalId: p.approvalId, outcome: outcome } })
+        .catch(function () {});
+    });
+  }
+  window.__dshRespond = function (msg) {
+    try { respond(msg && msg.ref, msg && msg.action); } catch (e) {}
+  };
+  function hook() {
+    if (!window.__ModuleLoader__ || window.__dshApprovalBridgeInstalled) return false;
+    window.__dshApprovalBridgeInstalled = true;
+    try {
+      window.__ModuleLoader__.load({ id: 'dsh-tray-approval-bridge', factory: function (require) {
+        var react = require('react');
+        function Bridge(props) {
+          var matched = props.matched;
+          react.useEffect(function () {
+            if (!matched) return undefined;
+            try { push(matched); } catch (e) {}
+            return function () { try { drop(matched.key); } catch (e) {} };
+          }, [matched]);
+          return null;
+        }
+        return {
+          inject: ['slots'],
+          apply: function (ctx) {
+            try {
+              ctx.locale.register('dsh-tray', { zh: {}, en: {} });
+            } catch (e) {}
+            try {
+              ctx.slots.inject('conversation.composer', function () { return ctx.slots.register({
+                name: 'conversation.composer',
+                select: function (state) {
+                  var i = state && state.interactions;
+                  if (!i) return null;
+                  for (var k = 0; k < i.length; k++) if (i[k] && i[k].kind === 'approval') return i[k];
+                  return null;
+                },
+                priority: 9999,
+                locale: 'dsh-tray'
+              }, Bridge); });
+            } catch (e) {
+              window.__dshApprovalBridgeInstalled = false;
+              console.warn('[dsh-tray] approval bridge slot failed', e);
+            }
+          }
+        };
+      }});
+      return true;
+    } catch (e) {
+      window.__dshApprovalBridgeInstalled = false;
+      console.warn('[dsh-tray] approval bridge load failed', e);
+      return false;
+    }
+  }
+  // 模块加载器就绪后挂载（轮询等待，最长 60s）
+  if (!hook()) {
+    var tries = 0;
+    var iv = setInterval(function () {
+      tries++;
+      if (hook() || tries > 120) clearInterval(iv);
+    }, 500);
+  }
+})();
+`
 
 var (
 	dshCmd  *exec.Cmd
@@ -117,11 +274,38 @@ const (
 
 // user32 绑定（x/sys/windows 不含 UI 函数，自行声明）
 var (
-	user32                  = syscall.NewLazyDLL("user32.dll")
-	procShowWindow          = user32.NewProc("ShowWindow")
-	procSetForegroundWindow = user32.NewProc("SetForegroundWindow")
-	procCreateIconFromRes   = user32.NewProc("CreateIconFromResourceEx")
-	procSendMessage         = user32.NewProc("SendMessageW")
+	user32                   = syscall.NewLazyDLL("user32.dll")
+	procShowWindow           = user32.NewProc("ShowWindow")
+	procSetForegroundWindow  = user32.NewProc("SetForegroundWindow")
+	procCreateIconFromRes    = user32.NewProc("CreateIconFromResourceEx")
+	procSendMessage          = user32.NewProc("SendMessageW")
+	procCreateWindowEx       = user32.NewProc("CreateWindowExW")
+	procRegisterClassEx      = user32.NewProc("RegisterClassExW")
+	procDefWindowProc        = user32.NewProc("DefWindowProcW")
+	procGetMessage           = user32.NewProc("GetMessageW")
+	procTranslateMessage     = user32.NewProc("TranslateMessage")
+	procDispatchMessage      = user32.NewProc("DispatchMessageW")
+	procPostMessage          = user32.NewProc("PostMessageW")
+	procPostQuitMessage      = user32.NewProc("PostQuitMessage")
+	procSetWindowPos         = user32.NewProc("SetWindowPos")
+	procSetWindowRgn         = user32.NewProc("SetWindowRgn")
+	procSetTimer             = user32.NewProc("SetTimer")
+	procKillTimer            = user32.NewProc("KillTimer")
+	procInvalidateRect       = user32.NewProc("InvalidateRect")
+	procIsWindowVisible      = user32.NewProc("IsWindowVisible")
+	procGetCursorPos         = user32.NewProc("GetCursorPos")
+	procMonitorFromPoint     = user32.NewProc("MonitorFromPoint")
+	procGetMonitorInfoW      = user32.NewProc("GetMonitorInfoW")
+	procSystemParametersInfo = user32.NewProc("SystemParametersInfoW")
+	procGetDpiForWindow      = user32.NewProc("GetDpiForWindow")
+	procGetDC                = user32.NewProc("GetDC")
+	procReleaseDC            = user32.NewProc("ReleaseDC")
+	procGetClientRect        = user32.NewProc("GetClientRect")
+	procDrawText             = user32.NewProc("DrawTextW")
+	procDrawIconEx           = user32.NewProc("DrawIconEx")
+	procBeginPaint           = user32.NewProc("BeginPaint")
+	procEndPaint             = user32.NewProc("EndPaint")
+	procTrackMouseEvent      = user32.NewProc("TrackMouseEvent")
 
 	kernel32                = syscall.NewLazyDLL("kernel32.dll")
 	procCreateMutex         = kernel32.NewProc("CreateMutexW")
@@ -130,6 +314,23 @@ var (
 	procSetEvent            = kernel32.NewProc("SetEvent")
 	procWaitForSingleObject = kernel32.NewProc("WaitForSingleObject")
 	procCloseHandle         = kernel32.NewProc("CloseHandle")
+	procGetModuleHandle     = kernel32.NewProc("GetModuleHandleW")
+	procMulDiv              = kernel32.NewProc("MulDiv")
+
+	gdi32                  = syscall.NewLazyDLL("gdi32.dll")
+	procCreateSolidBrush   = gdi32.NewProc("CreateSolidBrush")
+	procCreateRoundRectRgn = gdi32.NewProc("CreateRoundRectRgn")
+	procCreateFont         = gdi32.NewProc("CreateFontW")
+	procCreatePen          = gdi32.NewProc("CreatePen")
+	procDeleteObject       = gdi32.NewProc("DeleteObject")
+	procSelectObject       = gdi32.NewProc("SelectObject")
+	procSetBkMode          = gdi32.NewProc("SetBkMode")
+	procSetTextColor       = gdi32.NewProc("SetTextColor")
+	procGetStockObject     = gdi32.NewProc("GetStockObject")
+	procGetPixel           = gdi32.NewProc("GetPixel")
+	procRoundRect          = gdi32.NewProc("RoundRect")
+	procMoveToEx           = gdi32.NewProc("MoveToEx")
+	procLineTo             = gdi32.NewProc("LineTo")
 )
 
 const (
@@ -267,6 +468,710 @@ func abs(x int) int {
 	return x
 }
 
+// ---------- 桌面通知（自绘 toast 浮窗，白色卡片 + 每像素 alpha 渲染） ----------
+// Windows 11 不再渲染 Shell_NotifyIcon 传统气泡（API 返回成功但无画面），
+// 而系统 toast 要求非打包应用注册 AUMID。因此改为自绘置顶浮窗：
+// layered window（UpdateLayeredWindow + ARGB 位图）—— 卡片/圆角/阴影按像素绘制，
+// 文字用 ClearType 按物理分辨率渲染（高 DPI 不发糊），
+// 不经过系统通知路由（专注助手/请勿打扰/通知设置都无法拦截）。
+const (
+	wmUser         = 0x0400
+	wmTimer        = 0x0113
+	wmPaint        = 0x000F
+	wmLButtonUp    = 0x0202
+	wmRButtonUp    = 0x0205
+	wmMouseMove    = 0x0200
+	wmMouseLeave   = 0x02A3
+	wmClose        = 0x0010
+	wmDestroy      = 0x0002
+	toastCardW     = 400 // 卡片宽（96 DPI 基准）
+	toastMargin    = 16  // 距屏幕右下角
+	toastShowMs    = 6000
+	toastTimerID   = 1
+	toastShowMsg   = wmUser + 60
+	toastClass     = "DSHToastClass"
+	swpNoActivate  = 0x0010
+	swpShowWindow  = 0x0040
+	hwndTopmost    = ^uintptr(0) // HWND_TOPMOST = -1
+	wsPopup        = 0x80000000
+	wsExToolWindow = 0x00000080
+	wsExTopmost    = 0x00000008
+	wsExNoActivate = 0x08000000
+	dTNoPrefix     = 0x00000800
+	dTSingleLine   = 0x00000020
+	dTEndEllipsis  = 0x00008000
+	dTWordBreak    = 0x00000010
+	dTCalcRect     = 0x00000400
+	dTCenter       = 0x00000001
+	dTVCenter      = 0x00000004
+	transparent    = 1 // SetBkMode: TRANSPARENT
+	monitorNearest = 2 // MONITOR_DEFAULTTONEAREST
+	spiGetWorkArea = 0x0030
+	diNormal       = 3 // DrawIconEx: DI_NORMAL
+	fwSemibold     = 600
+	fwRegular      = 400
+	clearTypeQ     = 5 // CLEARTYPE_QUALITY
+	defaultCharset = 1
+	psSolid        = 0 // CreatePen: PS_SOLID
+	tmeLeave       = 0x00000002
+	// 浅色主题（GDI COLORREF，0x00BBGGRR）
+	toastBgGDI       = 0x00FFFFFF // 白底
+	toastBorderGDI   = 0x00E2E2E2 // 描边
+	toastTileBgGDI   = 0x00F3F4F6 // 瓦片底
+	toastTileEdgeGDI = 0x00E2E2E2 // 瓦片描边
+	btnRejectBgGDI   = 0x00FFFFFF // 次按钮底
+	btnRejectEdgeGDI = 0x00D9D9D9 // 次按钮描边
+	btnRejectHotGDI  = 0x00F5F5F5 // 次按钮 hover 底
+	btnRejectHotEGDI = 0x00BDBDBD // 次按钮 hover 描边
+	btnAllowBgGDI    = 0x007FA310 // 主按钮 RGB(16,163,127)
+	btnAllowHotGDI   = 0x0073930E // 主按钮 hover RGB(14,147,115)
+	// 布局（96 DPI 基准）
+	toastPad      = 16 // 卡片内边距
+	toastRadius   = 14 // 卡片圆角
+	toastIconSize = 40 // 图标瓦片
+	toastIconGap  = 12 // 瓦片与文字间距
+	toastTitleTop = 16
+	toastTitleH   = 28 // 标题行高（14pt 文字 ~19px，留足余量）
+	toastBodyTop  = 50 // 正文顶（标题底 + 8px 间距）
+	toastBottom   = 16 // 底部内边距
+	toastBtnH     = 34 // 按钮高
+	toastBtnTop   = 14 // 按钮距底
+	toastBtnGap   = 10 // 按钮间距
+	toastBtnPadX  = 18 // 按钮文字左右内边距
+	toastBtnR     = 9  // 按钮圆角
+	toastCloseSz  = 20 // 关闭按钮区域
+	toastCloseTop = 12
+	toastTileR    = 10 // 图标瓦片圆角
+	toastMinH     = 96
+	toastMaxH     = 300
+)
+
+var (
+	toastMu          sync.Mutex
+	toastHwnd        uintptr
+	toastTitle       string
+	toastBody        string
+	toastInteractive bool
+	toastActions     []notifyAction
+	toastRef         string // 应答回执标识（如 pending key）
+	toastHover       int    // 悬停区域：0 无 / 1 关闭 / 2.. 按钮
+	toastFontTitle   uintptr
+	toastFontBody    uintptr
+	toastFontButton  uintptr
+	toastFontDpi     uint32
+	toastIcon        uintptr // 鲸鱼 HICON，惰性创建
+	toastBtnBrushes  map[uint32]uintptr
+)
+
+type wndClassExW struct {
+	CbSize        uint32
+	Style         uint32
+	LpfnWndProc   uintptr
+	ClsExtra      int32
+	WndExtra      int32
+	HInstance     uintptr
+	HIcon         uintptr
+	HCursor       uintptr
+	HbrBackground uintptr
+	LpszMenuName  *uint16
+	LpszClassName *uint16
+	HIconSm       uintptr
+}
+
+type msg struct {
+	Hwnd    uintptr
+	Message uint32
+	WParam  uintptr
+	LParam  uintptr
+	Time    uint32
+	Pt      point
+}
+
+type rect struct {
+	Left, Top, Right, Bottom int32
+}
+
+type point struct {
+	X, Y int32
+}
+
+type monitorInfo struct {
+	CbSize    uint32
+	RcMonitor rect
+	RcWork    rect
+	DwFlags   uint32
+}
+
+type paintStruct struct {
+	Hdc         uintptr
+	FErase      bool
+	RcPaint     rect
+	FRestore    bool
+	FIncUpdate  bool
+	RgbReserved [32]byte
+}
+
+type trackMouseEvent struct {
+	CbSize      uint32
+	DwFlags     uint32
+	HWndTrack   uintptr
+	DwHoverTime uint32
+}
+
+type notifyAction struct {
+	ID    string `json:"id"`
+	Label string `json:"label"`
+}
+
+type notifyPayload struct {
+	Title              string         `json:"title"`
+	Body               string         `json:"body"`
+	Tag                string         `json:"tag"`
+	RequireInteraction bool           `json:"requireInteraction"`
+	Actions            []notifyAction `json:"actions"`
+	Ref                string         `json:"ref"`
+}
+
+// toast 窗口线程：独立消息泵（创建窗口必须与消息循环同线程）
+func toastLoop() {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	hinst, _, _ := procGetModuleHandle.Call(0)
+	className, _ := syscall.UTF16PtrFromString(toastClass)
+	wc := wndClassExW{
+		CbSize:        uint32(unsafe.Sizeof(wndClassExW{})),
+		LpfnWndProc:   windows.NewCallback(toastWndProc),
+		HInstance:     hinst,
+		HbrBackground: toastBrush(toastBgGDI),
+		LpszClassName: className,
+	}
+	procRegisterClassEx.Call(uintptr(unsafe.Pointer(&wc)))
+
+	h, _, _ := procCreateWindowEx.Call(
+		wsExToolWindow|wsExTopmost|wsExNoActivate,
+		uintptr(unsafe.Pointer(className)),
+		0, // 无标题
+		wsPopup,
+		0, 0, 100, 100, // 先隐藏创建，显示时再定位
+		0, 0, hinst, 0,
+	)
+	toastMu.Lock()
+	toastHwnd = h
+	toastMu.Unlock()
+	Log("通知: toast 窗口就绪 hwnd=0x" + fmt.Sprintf("%X", h))
+
+	var m msg
+	for {
+		r, _, _ := procGetMessage.Call(uintptr(unsafe.Pointer(&m)), 0, 0, 0)
+		if int32(r) <= 0 {
+			break
+		}
+		procTranslateMessage.Call(uintptr(unsafe.Pointer(&m)))
+		procDispatchMessage.Call(uintptr(unsafe.Pointer(&m)))
+	}
+	toastMu.Lock()
+	toastHwnd = 0
+	toastMu.Unlock()
+	Log("通知: toast 线程退出")
+}
+
+// 页面通知桥入口：JS shim → 这里
+func showToast(p notifyPayload) bool {
+	toastMu.Lock()
+	toastTitle = p.Title
+	toastBody = p.Body
+	toastInteractive = p.RequireInteraction
+	toastActions = p.Actions
+	toastRef = p.Ref
+	toastHover = 0
+	h := toastHwnd
+	toastMu.Unlock()
+	if h == 0 {
+		Log("通知: toast 窗口未就绪")
+		return false
+	}
+	procPostMessage.Call(h, toastShowMsg, 0, 0)
+	Log("通知: " + p.Title + " — " + p.Body)
+	return true
+}
+
+func toastWndProc(hwnd uintptr, message uint32, wparam, lparam uintptr) uintptr {
+	switch message {
+	case toastShowMsg:
+		showToastWindow(hwnd)
+		return 0
+	case wmTimer:
+		if wparam == toastTimerID {
+			procShowWindow.Call(hwnd, swHide)
+			return 0
+		}
+	case wmLButtonUp:
+		toastClick(hwnd, int32(int16(lparam&0xFFFF)), int32(int16(lparam>>16)))
+		return 0
+	case wmRButtonUp:
+		procShowWindow.Call(hwnd, swHide)
+		return 0
+	case wmMouseMove:
+		h := toastHit(hwnd, int32(int16(lparam&0xFFFF)), int32(int16(lparam>>16)))
+		toastMu.Lock()
+		changed := h != toastHover
+		toastHover = h
+		toastMu.Unlock()
+		if changed {
+			procInvalidateRect.Call(hwnd, 0, 1)
+		}
+		tme := trackMouseEvent{CbSize: uint32(unsafe.Sizeof(trackMouseEvent{})), DwFlags: tmeLeave, HWndTrack: hwnd}
+		procTrackMouseEvent.Call(uintptr(unsafe.Pointer(&tme)))
+		return 0
+	case wmMouseLeave:
+		toastMu.Lock()
+		toastHover = 0
+		toastMu.Unlock()
+		procInvalidateRect.Call(hwnd, 0, 1)
+		return 0
+	case wmDestroy:
+		// DefWindowProc 不会自动 PostQuitMessage，这里显式结束消息泵
+		procPostQuitMessage.Call(0)
+		r, _, _ := procDefWindowProc.Call(hwnd, uintptr(message), wparam, lparam)
+		return r
+	case wmPaint:
+		paintToast(hwnd)
+		return 0
+	}
+	r, _, _ := procDefWindowProc.Call(hwnd, uintptr(message), wparam, lparam)
+	return r
+}
+
+// 点击处理：关闭 × / 操作按钮 / 其余区域聚焦窗口
+func toastClick(hwnd uintptr, x, y int32) {
+	hit := toastHit(hwnd, x, y)
+	switch {
+	case hit == 1: // 关闭
+		Log("通知: 点击关闭")
+		procShowWindow.Call(hwnd, swHide)
+	case hit >= 2: // 操作按钮
+		toastMu.Lock()
+		actions := toastActions
+		ref := toastRef
+		toastMu.Unlock()
+		i := hit - 2
+		if i < len(actions) {
+			Log("通知: 按钮 " + actions[i].ID)
+			procShowWindow.Call(hwnd, swHide)
+			sendRespond(ref, actions[i].ID)
+		}
+	default:
+		Log("通知: 点击通知浮窗，聚焦窗口")
+		procShowWindow.Call(hwnd, swHide)
+		showWindow()
+	}
+}
+
+// 把按钮结果回传给页面（window.__dshRespond，由页面注入模块应答 pending）
+func sendRespond(ref, action string) {
+	if ref == "" {
+		return
+	}
+	wvMu.Lock()
+	w := wv
+	wvMu.Unlock()
+	if w == nil {
+		Log("通知: 页面不存在，无法应答 " + action)
+		return
+	}
+	js := "window.__dshRespond && window.__dshRespond(" + jsString(map[string]string{"ref": ref, "action": action}) + ")"
+	w.Dispatch(func() { w.Eval(js) })
+}
+
+// 显示/更新浮窗：定位（不显示）→ UpdateLayeredWindow 上屏 → 再显示
+// （layered 窗口必须先 ULW 后 Show，顺序反了内容可能不出现）
+func showToastWindow(hwnd uintptr) {
+	procKillTimer.Call(hwnd, toastTimerID)
+
+	toastMu.Lock()
+	interactive := toastInteractive
+	actions := toastActions
+	toastMu.Unlock()
+
+	dpi := getToastDpi(hwnd)
+	g := toastGeometry(dpi, actions)
+	x, y := toastPos(dpi, g.WinW, g.WinH)
+	procSetWindowPos.Call(hwnd, hwndTopmost, uintptr(x), uintptr(y), uintptr(g.WinW), uintptr(g.WinH), swpNoActivate|swpShowWindow)
+
+	// 双步定位：跨 DPI 显示器时按目标 dpi 重新测量
+	dpi2 := getToastDpi(hwnd)
+	if dpi2 != dpi {
+		g = toastGeometry(dpi2, actions)
+		x, y = toastPos(dpi2, g.WinW, g.WinH)
+		procSetWindowPos.Call(hwnd, hwndTopmost, uintptr(x), uintptr(y), uintptr(g.WinW), uintptr(g.WinH), swpNoActivate|swpShowWindow)
+	}
+
+	// 圆角窗口区域（GDI 普通窗口，兼容远程/虚拟显示环境）
+	rgn, _, _ := procCreateRoundRectRgn.Call(0, 0, uintptr(g.WinW), uintptr(g.WinH), uintptr(scale(toastRadius*2, dpi)), uintptr(scale(toastRadius*2, dpi)))
+	if rgn != 0 {
+		procSetWindowRgn.Call(hwnd, rgn, 1)
+	}
+	procInvalidateRect.Call(hwnd, 0, 1)
+	if !interactive {
+		procSetTimer.Call(hwnd, toastTimerID, toastShowMs, 0)
+	}
+}
+
+// DPI 精确缩放
+func scale(v int32, dpi uint32) int32 {
+	return v * int32(dpi) / 96
+}
+
+// 浮窗位置：光标所在显示器工作区右下角（含边距）
+func toastPos(dpi uint32, w, h int) (int32, int32) {
+	work := workArea()
+	dx := int32(w) + toastMargin
+	dy := int32(h) + toastMargin
+	x := work.Right - dx
+	y := work.Bottom - dy
+	if x < work.Left+toastMargin {
+		x = work.Left + toastMargin
+	}
+	if y < work.Top+toastMargin {
+		y = work.Top + toastMargin
+	}
+	return x, y
+}
+
+// 光标所在显示器的工作区；失败回退主屏
+func workArea() rect {
+	var pt point
+	procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
+	ptv := uintptr(uint32(pt.X)) | (uintptr(uint32(pt.Y)) << 32) // POINT 按值传递
+	mi := monitorInfo{CbSize: uint32(unsafe.Sizeof(monitorInfo{}))}
+	if hMon, _, _ := procMonitorFromPoint.Call(ptv, monitorNearest); hMon != 0 {
+		if r, _, _ := procGetMonitorInfoW.Call(hMon, uintptr(unsafe.Pointer(&mi))); r != 0 {
+			return mi.RcWork
+		}
+	}
+	var wa rect
+	procSystemParametersInfo.Call(spiGetWorkArea, 0, uintptr(unsafe.Pointer(&wa)), 0)
+	return wa
+}
+
+func getToastDpi(hwnd uintptr) uint32 {
+	if dpi, _, _ := procGetDpiForWindow.Call(hwnd); dpi != 0 {
+		return uint32(dpi)
+	}
+	return 96
+}
+
+// 几何布局（窗口坐标）
+type toastGeom struct {
+	Card    rect // 卡片区域（= 窗口客户区）
+	Title   rect
+	Body    rect
+	Close   rect
+	Tile    rect
+	Buttons []rect
+	CardW   int
+	CardH   int
+	WinW    int
+	WinH    int
+}
+
+// 完整几何：按 dpi 与 actions 计算卡片尺寸与各区域
+func toastGeometry(dpi uint32, actions []notifyAction) toastGeom {
+	cardW := int(scale(toastCardW, dpi))
+	bodyW := cardW - int(scale(toastPad+toastIconSize+toastIconGap, dpi)) - int(scale(toastPad, dpi))
+	toastMu.Lock()
+	body := toastBody
+	toastMu.Unlock()
+	bodyH := measureBodyH(body, dpi, bodyW)
+	// 卡片高度必须与 layoutToast 的矩形一致地按 DPI 缩放：
+	// bodyH 是已按 dpi 实测的高度，若这里仍用 96-DPI 基准常量相加，
+	// 高 DPI 下 cardH 偏小，layoutToast 再把各矩形按 dpi 放大后，
+	// 正文矩形高度会被压到不足一行 —— DrawText 把字形下半截裁掉（半截字）。
+	cardH := int(scale(toastBodyTop, dpi)) + bodyH + int(scale(toastBottom, dpi))
+	if len(actions) > 0 {
+		cardH = int(scale(toastBodyTop, dpi)) + bodyH + int(scale(12+toastBtnH+toastBtnTop, dpi))
+	}
+	minH := int(scale(toastMinH, dpi))
+	if len(actions) > 0 {
+		minH = minH + int(scale(30, dpi))
+	}
+	if cardH < minH {
+		cardH = minH
+	}
+	maxH := int(scale(toastMaxH, dpi))
+	if cardH > maxH {
+		cardH = maxH
+	}
+	return layoutToast(dpi, cardW, cardH, actions)
+}
+
+// 布局：卡片/标题/正文/关闭/按钮（按钮从右往左排，最后一个为主按钮）
+func layoutToast(dpi uint32, cardW, cardH int, actions []notifyAction) toastGeom {
+	g := toastGeom{}
+	g.CardW, g.CardH = cardW, cardH
+	g.WinW, g.WinH = cardW, cardH
+	ox, oy := int32(0), int32(0)
+	g.Card = rect{ox, oy, ox + int32(cardW), oy + int32(cardH)}
+
+	pad := scale(toastPad, dpi)
+	iconSize := scale(toastIconSize, dpi)
+	g.Tile = rect{ox + pad, oy + pad, ox + pad + iconSize, oy + pad + iconSize}
+
+	titleX := ox + pad + iconSize + scale(toastIconGap, dpi)
+	titleRight := ox + int32(cardW) - pad
+	g.Title = rect{titleX, oy + scale(toastTitleTop, dpi), titleRight, oy + scale(toastTitleTop, dpi) + scale(toastTitleH, dpi)}
+
+	cs := scale(toastCloseSz, dpi)
+	g.Close = rect{titleRight - cs, oy + scale(toastCloseTop, dpi), titleRight, oy + scale(toastCloseTop, dpi) + cs}
+
+	bodyBottom := oy + int32(cardH) - scale(toastBottom, dpi)
+	if len(actions) > 0 {
+		bodyBottom = oy + int32(cardH) - scale(12+toastBtnH+toastBtnTop, dpi)
+	}
+	g.Body = rect{titleX, oy + scale(toastBodyTop, dpi), titleRight, bodyBottom}
+
+	if len(actions) > 0 {
+		hdc, _, _ := procGetDC.Call(0)
+		if hdc != 0 {
+			_, _, fBtn := toastFonts(dpi)
+			by := oy + int32(cardH) - scale(toastBtnTop, dpi) - scale(toastBtnH, dpi)
+			x := titleRight
+			for i := len(actions) - 1; i >= 0; i-- {
+				bw := scale(int32(textWidth(hdc, actions[i].Label, fBtn)+2*toastBtnPadX), dpi)
+				r := rect{x - bw, by, x, by + scale(toastBtnH, dpi)}
+				g.Buttons = append(g.Buttons, r)
+				x = r.Left - scale(toastBtnGap, dpi)
+			}
+			procReleaseDC.Call(0, hdc)
+			for i, j := 0, len(g.Buttons)-1; i < j; i, j = i+1, j-1 {
+				g.Buttons[i], g.Buttons[j] = g.Buttons[j], g.Buttons[i]
+			}
+		}
+	}
+	return g
+}
+
+// 正文自然换行高度（DT_CALCRECT）
+func measureBodyH(body string, dpi uint32, width int) int {
+	if body == "" {
+		return 0
+	}
+	hdc, _, _ := procGetDC.Call(0)
+	if hdc == 0 {
+		return int(scale(18, dpi))
+	}
+	defer procReleaseDC.Call(0, hdc)
+	_, fBody, _ := toastFonts(dpi)
+	procSelectObject.Call(hdc, fBody)
+	b, _ := syscall.UTF16FromString(body)
+	r := rect{0, 0, int32(width), 0}
+	procDrawText.Call(hdc, uintptr(unsafe.Pointer(&b[0])), ^uintptr(0), uintptr(unsafe.Pointer(&r)), dTWordBreak|dTNoPrefix|dTCalcRect)
+	return int(r.Bottom - r.Top)
+}
+
+func inRect(x, y int32, r rect) bool {
+	return x >= r.Left && x < r.Right && y >= r.Top && y < r.Bottom
+}
+
+// 命中测试：0 无 / 1 关闭 / 2.. 按钮
+func toastHit(hwnd uintptr, x, y int32) int {
+	dpi := getToastDpi(hwnd)
+	toastMu.Lock()
+	actions := toastActions
+	toastMu.Unlock()
+	g := toastGeometry(dpi, actions)
+	if inRect(x, y, g.Close) {
+		return 1
+	}
+	for i, r := range g.Buttons {
+		if inRect(x, y, r) {
+			return 2 + i
+		}
+	}
+	return 0
+}
+
+// 缓存按 DPI 创建的标题/正文/按钮字体（Segoe UI，ClearType 抗锯齿）
+func toastFonts(dpi uint32) (uintptr, uintptr, uintptr) {
+	if toastFontTitle != 0 && toastFontDpi == dpi {
+		return toastFontTitle, toastFontBody, toastFontButton
+	}
+	if toastFontTitle != 0 {
+		procDeleteObject.Call(toastFontTitle)
+		procDeleteObject.Call(toastFontBody)
+		procDeleteObject.Call(toastFontButton)
+	}
+	face, _ := syscall.UTF16PtrFromString("Segoe UI")
+	toastFontTitle, _, _ = procCreateFont.Call(
+		uintptr(int32(-mulDiv(14, int32(dpi), 72))), // 14pt
+		0, 0, 0, fwSemibold, 0, 0, 0, defaultCharset, 0, 0, clearTypeQ, 0,
+		uintptr(unsafe.Pointer(face)),
+	)
+	toastFontBody, _, _ = procCreateFont.Call(
+		uintptr(int32(-mulDiv(11, int32(dpi), 72))), // 11pt
+		0, 0, 0, fwRegular, 0, 0, 0, defaultCharset, 0, 0, clearTypeQ, 0,
+		uintptr(unsafe.Pointer(face)),
+	)
+	toastFontButton, _, _ = procCreateFont.Call(
+		uintptr(int32(-mulDiv(11, int32(dpi), 72))), // 11pt
+		0, 0, 0, fwSemibold, 0, 0, 0, defaultCharset, 0, 0, clearTypeQ, 0,
+		uintptr(unsafe.Pointer(face)),
+	)
+	toastFontDpi = dpi
+	return toastFontTitle, toastFontBody, toastFontButton
+}
+
+func textWidth(hdc uintptr, s string, f uintptr) int {
+	procSelectObject.Call(hdc, f)
+	b, _ := syscall.UTF16FromString(s)
+	r := rect{0, 0, 0, 0}
+	procDrawText.Call(hdc, uintptr(unsafe.Pointer(&b[0])), ^uintptr(0), uintptr(unsafe.Pointer(&r)), dTSingleLine|dTNoPrefix|dTCalcRect)
+	return int(r.Right - r.Left)
+}
+
+// × 关闭符号
+func drawCross(hdc uintptr, cx, cy, size int32, color uint32) {
+	pen, _, _ := procCreatePen.Call(psSolid, 1, uintptr(color))
+	if pen == 0 {
+		return
+	}
+	procSelectObject.Call(hdc, pen)
+	procMoveToEx.Call(hdc, uintptr(cx-size/2), uintptr(cy-size/2), 0)
+	procLineTo.Call(hdc, uintptr(cx+size/2), uintptr(cy+size/2))
+	procMoveToEx.Call(hdc, uintptr(cx+size/2), uintptr(cy-size/2), 0)
+	procLineTo.Call(hdc, uintptr(cx-size/2), uintptr(cy+size/2))
+	procSelectObject.Call(hdc, 0)
+	procDeleteObject.Call(pen)
+}
+
+// 画刷缓存（不销毁，进程内数量有限）
+func toastBrush(color uint32) uintptr {
+	if toastBtnBrushes == nil {
+		toastBtnBrushes = map[uint32]uintptr{}
+	}
+	if b := toastBtnBrushes[color]; b != 0 {
+		return b
+	}
+	b, _, _ := procCreateSolidBrush.Call(uintptr(color))
+	toastBtnBrushes[color] = b
+	return b
+}
+
+// 圆角矩形实心填充（NULL_PEN 无描边）
+func roundRectFillGDI(hdc uintptr, r rect, radius uint32, color uint32) {
+	np, _, _ := procGetStockObject.Call(8) // NULL_PEN
+	procSelectObject.Call(hdc, np)
+	procSelectObject.Call(hdc, toastBrush(color))
+	procRoundRect.Call(hdc, uintptr(r.Left), uintptr(r.Top), uintptr(r.Right), uintptr(r.Bottom), uintptr(radius*2), uintptr(radius*2))
+}
+
+// 浅色按钮：次按钮（描边）与主按钮（实心绿）
+func drawButtonGDI(hdc uintptr, r rect, label string, primary, hot bool, dpi uint32) {
+	var edge, bg uint32 = btnRejectEdgeGDI, btnRejectBgGDI
+	if primary {
+		bg = btnAllowBgGDI
+	}
+	if hot {
+		if primary {
+			bg = btnAllowHotGDI
+		} else {
+			bg, edge = btnRejectHotGDI, btnRejectHotEGDI
+		}
+	}
+	br := uint32(scale(toastBtnR, dpi))
+	roundRectFillGDI(hdc, r, br, edge)
+	one := uint32(scale(1, dpi))
+	roundRectFillGDI(hdc, rect{r.Left + 1, r.Top + 1, r.Right - 1, r.Bottom - 1}, br-one, bg)
+	procSelectObject.Call(hdc, toastFontButton)
+	txt := uintptr(0x333333)
+	if primary {
+		txt = 0xFFFFFF
+	}
+	procSetTextColor.Call(hdc, txt)
+	procSetBkMode.Call(hdc, transparent)
+	tr := rect{r.Left + scale(toastBtnPadX, dpi), r.Top, r.Right - scale(toastBtnPadX, dpi), r.Bottom}
+	b, _ := syscall.UTF16FromString(label)
+	procDrawText.Call(hdc, uintptr(unsafe.Pointer(&b[0])), ^uintptr(0), uintptr(unsafe.Pointer(&tr)), dTSingleLine|dTNoPrefix|dTCenter|dTVCenter)
+}
+
+// 绘制浮窗（普通 GDI 窗口：兼容远程桌面/虚拟显示，ClearType 文字）
+func paintToast(hwnd uintptr) {
+	var ps paintStruct
+	hdc, _, _ := procBeginPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
+	if hdc == 0 {
+		return
+	}
+	defer procEndPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
+
+	toastMu.Lock()
+	title, body, actions, hover := toastTitle, toastBody, toastActions, toastHover
+	toastMu.Unlock()
+
+	dpi := getToastDpi(hwnd)
+	g := toastGeometry(dpi, actions)
+	one := uint32(scale(1, dpi))
+	radius := uint32(scale(toastRadius, dpi))
+
+	// 卡片：白底 + 1px 浅灰描边（圆角区域由 SetWindowRgn 裁切）
+	roundRectFillGDI(hdc, g.Card, radius, toastBorderGDI)
+	roundRectFillGDI(hdc, rect{g.Card.Left + 1, g.Card.Top + 1, g.Card.Right - 1, g.Card.Bottom - 1}, radius-one, toastBgGDI)
+
+	// 图标瓦片
+	tileR := uint32(scale(toastTileR, dpi))
+	roundRectFillGDI(hdc, g.Tile, tileR, toastTileEdgeGDI)
+	roundRectFillGDI(hdc, rect{g.Tile.Left + 1, g.Tile.Top + 1, g.Tile.Right - 1, g.Tile.Bottom - 1}, tileR-one, toastTileBgGDI)
+
+	// 按钮底色
+	for i, r := range g.Buttons {
+		drawButtonGDI(hdc, r, actions[i].Label, i == len(g.Buttons)-1, hover == 2+i, dpi)
+	}
+
+	// 文字（ClearType）
+	fTitle, fBody, _ := toastFonts(dpi)
+	procSetBkMode.Call(hdc, transparent)
+
+	// 标题
+	procSelectObject.Call(hdc, fTitle)
+	procSetTextColor.Call(hdc, 0x111111)
+	tp, _ := syscall.UTF16FromString(title)
+	procDrawText.Call(hdc, uintptr(unsafe.Pointer(&tp[0])), ^uintptr(0), uintptr(unsafe.Pointer(&g.Title)), dTSingleLine|dTNoPrefix|dTEndEllipsis)
+
+	// 正文
+	procSelectObject.Call(hdc, fBody)
+	procSetTextColor.Call(hdc, 0x5A5A5A)
+	bp, _ := syscall.UTF16FromString(body)
+	procDrawText.Call(hdc, uintptr(unsafe.Pointer(&bp[0])), ^uintptr(0), uintptr(unsafe.Pointer(&g.Body)), dTWordBreak|dTNoPrefix)
+
+	// 鲸鱼图标（瓦片内 32px）
+	if toastIcon == 0 {
+		toastIcon = iconFromIco(icoBytes, 32, 32)
+	}
+	if toastIcon != 0 {
+		isz := scale(32, dpi)
+		ix := g.Tile.Left + (g.Tile.Right-g.Tile.Left-isz)/2
+		iy := g.Tile.Top + (g.Tile.Bottom-g.Tile.Top-isz)/2
+		procDrawIconEx.Call(hdc, uintptr(ix), uintptr(iy), toastIcon, uintptr(isz), uintptr(isz), 0, 0, diNormal)
+	}
+
+	// 关闭 ×
+	crossClr := uint32(0x9A9A9A)
+	if hover == 1 {
+		crossClr = 0x333333
+	}
+	drawCross(hdc, (g.Close.Left+g.Close.Right)/2, (g.Close.Top+g.Close.Bottom)/2, scale(10, dpi), crossClr)
+}
+
+func mulDiv(a, b, c int32) int32 {
+	r, _, _ := procMulDiv.Call(uintptr(a), uintptr(b), uintptr(c))
+	return int32(r)
+}
+
+func jsString(v interface{}) string {
+	b, _ := json.Marshal(v)
+	return string(b)
+}
+
 func main() {
 	initDpiAware() // 必须在任何窗口创建前声明 DPI 感知（否则 WebView2 内容被位图缩放导致模糊）
 	if !acquireSingleton() {
@@ -306,6 +1211,9 @@ func onReady() {
 
 	// 监听其他实例的"显示窗口"请求（双击桌面图标时）
 	go watchShowEvent()
+
+	// 通知浮窗线程（自绘 toast，独立消息泵）
+	go toastLoop()
 
 	// 预创建窗口：立即显示转圈加载页，服务就绪后自动切换到界面
 	if portOpen(port) {
@@ -357,6 +1265,12 @@ func runWebview() {
 	w.Bind("__dshOpenExternal", func(url string) {
 		openEdge(url)
 	})
+	// 页面通知桥：JS 端 Notification shim → Go 原生通知浮窗
+	w.Bind("__dshNativeNotify", func(p notifyPayload) {
+		showToast(p)
+	})
+	// 在页面任何脚本执行前注入 Notification shim（每次新文档自动生效）
+	w.Init(notifyShimScript)
 
 	h := uintptr(w.Window())
 	wvMu.Lock()

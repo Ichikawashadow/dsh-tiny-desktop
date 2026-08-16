@@ -17,6 +17,8 @@
 - **Tiny**: a single ~7.5 MB executable — no Electron (100–250 MB), no installer, no external runtime files
 - **Native window**: WebView2-based, no browser tabs to manage
 - **System tray**: whale icon resident in the tray; close the window and the service keeps running
+- **Desktop notifications**: the page's `Notification` API is bridged to a **white-card toast** (bottom-right, rounded corners with a light border, crisp ClearType text; hover states and action buttons, clicking focuses the window) — plugins like `dsh-notification` work out of the box, with no browser-style permission prompt and no reliance on the OS notification pipeline (Windows 11 no longer renders legacy tray balloons). It's a plain GDI window, so it renders reliably even over remote desktop / virtual displays; opening the same UI in a real browser still uses the browser's native notifications
+- **Approve from the toast**: DSH **approval requests** (tool execution needing permission) pop up with **Allow once / Reject** buttons answered directly on the toast — no need to switch back to the window; it uses the same client-runtime response channel as the GUI (`approval/requested` → `PendingWait.respond`)
 - **Always fresh**: automatically uses the **latest** `@deepseek-ai/dsh` from your npx cache — no manual updates
 - **Memory-friendly**: closing the window destroys WebView2 (~500 MB freed); reopening rebuilds on demand
 - **Zoom**: Ctrl + scroll / Ctrl + `+` `-` to zoom the page (0.5x–2x)
