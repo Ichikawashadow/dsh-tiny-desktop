@@ -1350,7 +1350,7 @@ func startDsh() {
 		Log("找不到 node/dsh CLI: node=" + node + " bin=" + bin)
 		return
 	}
-	cmd := exec.Command(node, bin, "web", "--port", itoa(port))
+	cmd := exec.Command(node, bin, "web", "--port", itoa(port), "--no-open")
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000} // CREATE_NO_WINDOW
 	lf, err := openLogFile()
 	if err == nil {
