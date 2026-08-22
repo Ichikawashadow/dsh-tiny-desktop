@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/getlantern/systray"
 	webview "github.com/jchv/go-webview2"
 )
 
@@ -482,7 +483,6 @@ func TestParsePackageVersion(t *testing.T) {
 		t.Errorf("parsePackageVersion = %q; want 0.1.1-rc.2", ver)
 	}
 
-	// 不存在的文件返回空
 	if ver2 := parsePackageVersion(filepath.Join(tmpDir, "nonexistent.json")); ver2 != "" {
 		t.Errorf("parsePackageVersion nonexistent = %q; want empty string", ver2)
 	}

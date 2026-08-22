@@ -1176,6 +1176,7 @@ func jsString(v interface{}) string {
 }
 
 func main() {
+	runtime.LockOSThread()
 	initDpiAware() // 必须在任何窗口创建前声明 DPI 感知（否则 WebView2 内容被位图缩放导致模糊）
 	if !acquireSingleton() {
 		// 已有实例在运行：已通知其显示窗口，本进程退出
