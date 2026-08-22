@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/getlantern/systray"
 	webview "github.com/jchv/go-webview2"
 )
 
@@ -485,5 +484,36 @@ func TestParsePackageVersion(t *testing.T) {
 
 	if ver2 := parsePackageVersion(filepath.Join(tmpDir, "nonexistent.json")); ver2 != "" {
 		t.Errorf("parsePackageVersion nonexistent = %q; want empty string", ver2)
+	}
+}
+
+func TestPatchPiAiFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	sampleFile := filepath.Join(tmpDir, "index.js")
+	originalContent := "async function discoverModels(request, storedApiKey) {\n\tconst installed = catalogModels(request.provider);\n\treturn [];\n}"
+	if err := os.WriteFile(sampleFile, []byte(originalContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	patchPiAiFile(sampleFile)
+
+	patchedBytes, err := os.ReadFile(sampleFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	patchedContent := string(patchedBytes)
+
+	if !strings.Contains(patchedContent, "__DSH_LIVE_DISCOVERY_PATCH__") {
+		t.Errorf("patchPiAiFile did not apply patch correctly:\n%s", patchedContent)
+	}
+	if !strings.Contains(patchedContent, "targetBaseURL = \"https://opencode.ai/zen/go/v1\"") {
+		t.Errorf("patchPiAiFile missing default opencode-go URL:\n%s", patchedContent)
+	}
+
+	// 二次调用应当幂等
+	patchPiAiFile(sampleFile)
+	doubleBytes, _ := os.ReadFile(sampleFile)
+	if string(doubleBytes) != patchedContent {
+		t.Errorf("patchPiAiFile is not idempotent")
 	}
 }

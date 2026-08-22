@@ -1220,6 +1220,9 @@ func onReady() {
 	// 通知浮窗线程（自绘 toast，独立消息泵）
 	go toastLoop()
 
+	// 确保 DSH 云端模型实时发现守护补丁已就绪
+	ensureDshPatches()
+
 	// 预创建窗口：立即显示转圈加载页，服务就绪后自动切换到界面
 	if portOpen(port) {
 		Log("端口 " + itoa(port) + " 已有服务，直接驻留")
@@ -1351,6 +1354,7 @@ func portOpen(p int) bool {
 
 // ---------- 服务进程 ----------
 func startDsh() {
+	ensureDshPatches()
 	node := findNode()
 	bin := findBinJs()
 	if node == "" || bin == "" {
@@ -1743,6 +1747,43 @@ func cleanNpxLocks() {
 	}
 }
 
+// 自动为 dsh-llm-pi-ai 打上「实时云端模型发现」守护补丁，
+// 确保即使 DSH 官方升级，设置页面里的「获取可用模型」也始终能够实时请求云端 API。
+func ensureDshPatches() {
+	candidates := findAllBinJsCandidates()
+	for _, cand := range candidates {
+		dshDir := filepath.Dir(filepath.Dir(cand.path))
+		piAiLib := filepath.Join(dshDir, "node_modules", "@deepseek-ai", "dsh-llm-pi-ai", "lib", "index.js")
+		patchPiAiFile(piAiLib)
+	}
+}
+
+func patchPiAiFile(filePath string) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return
+	}
+	content := string(data)
+	if strings.Contains(content, "__DSH_LIVE_DISCOVERY_PATCH__") {
+		return
+	}
+
+	targetSnippet := "const installed = catalogModels(request.provider);"
+	if !strings.Contains(content, targetSnippet) {
+		return
+	}
+
+	patchCode := "// __DSH_LIVE_DISCOVERY_PATCH__ (dsh-tiny-desktop auto-patch)\n\tlet targetBaseURL = request.baseURL;\n\tif (!targetBaseURL && request.provider === \"opencode-go\") {\n\t\ttargetBaseURL = \"https://opencode.ai/zen/go/v1\";\n\t}\n\tif (targetBaseURL && targetBaseURL.length > 0) {\n\t\tconst api = request.api ?? \"openai-completions\";\n\t\tif (LISTABLE_PROTOCOLS.has(api)) {\n\t\t\ttry {\n\t\t\t\tconst url = listingUrl(targetBaseURL);\n\t\t\t\tconst supplied = request.apiKey ?? await storedApiKey?.();\n\t\t\t\tconst apiKey = supplied === void 0 ? void 0 : usableProbeKey(supplied);\n\t\t\t\tlet response = await fetch(url, {\n\t\t\t\t\tmethod: \"GET\",\n\t\t\t\t\theaders: {\n\t\t\t\t\t\taccept: \"application/json\",\n\t\t\t\t\t\t...apiKey === void 0 ? {} : { authorization: `Bearer ${apiKey}` },\n\t\t\t\t\t\t...attributionHeaders()\n\t\t\t\t\t},\n\t\t\t\t\t...request.signal === void 0 ? {} : { signal: request.signal }\n\t\t\t\t});\n\t\t\t\tif (response.ok) {\n\t\t\t\t\tconst text = await readBounded(response, url);\n\t\t\t\t\tconst body = JSON.parse(text);\n\t\t\t\t\tconst models = readListing(body);\n\t\t\t\t\tif (models && models.length > 0) {\n\t\t\t\t\t\treturn models;\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t} catch (e) {}\n\t\t}\n\t}\n\t"
+
+	anchor := "async function discoverModels(request, storedApiKey) {\n"
+	if strings.Contains(content, anchor) {
+		newContent := strings.Replace(content, anchor, anchor+"\t"+patchCode, 1)
+		if err := os.WriteFile(filePath, []byte(newContent), 0644); err == nil {
+			Log("已成功应用 DSH 云端模型实时发现守护补丁: " + filePath)
+		}
+	}
+}
+
 var (
 	updateMu   sync.Mutex
 	isUpdating bool
@@ -1836,6 +1877,9 @@ func updateDshKernel() {
 	}
 
 	Log("更新执行成功:\n" + string(output))
+
+	// 更新后自动应用补丁，确保设置中的云端发现能力不丢失
+	ensureDshPatches()
 
 	// 3. 获取更新后的版本号
 	newVer := getInstalledDshVersion()
