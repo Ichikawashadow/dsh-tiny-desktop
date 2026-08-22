@@ -13,16 +13,19 @@
 package main
 
 import (
+	"context"
 	_ "embed"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -1206,6 +1209,7 @@ func onReady() {
 	mOpen := systray.AddMenuItem("打开 DeepSeek Harness", "显示窗口")
 	mBrowser := systray.AddMenuItem("在浏览器中打开", "用默认浏览器打开")
 	mRestart := systray.AddMenuItem("重启服务", "重启 DSH 服务")
+	mUpdate := systray.AddMenuItem("检查并更新 DSH", "检查并更新 DSH 内核至最新版")
 	systray.AddSeparator()
 	mQuit := systray.AddMenuItem("退出（停止服务）", "停止服务并退出托盘")
 
@@ -1234,6 +1238,8 @@ func onReady() {
 				openBrowser()
 			case <-mRestart.ClickedCh:
 				restartService()
+			case <-mUpdate.ClickedCh:
+				go updateDshKernel()
 			case <-mQuit.ClickedCh:
 				exiting = true
 				stopDsh()
@@ -1439,35 +1445,421 @@ func findOnPath(name string) string {
 	return ""
 }
 
-func findBinJs() string {
-	local := os.Getenv("LOCALAPPDATA")
-	if local == "" {
-		return ""
+func findNpm() string {
+	if p := findOnPath("npm.cmd"); p != "" {
+		return p
 	}
-	npxRoot := filepath.Join(local, "npm-cache", "_npx")
-	dirs, err := os.ReadDir(npxRoot)
+	if p := findOnPath("npm.exe"); p != "" {
+		return p
+	}
+	if p := findOnPath("npm"); p != "" {
+		return p
+	}
+	alt := `C:\Program Files\nodejs\npm.cmd`
+	if _, err := os.Stat(alt); err == nil {
+		return alt
+	}
+	return ""
+}
+
+func findNpx() string {
+	if p := findOnPath("npx.cmd"); p != "" {
+		return p
+	}
+	if p := findOnPath("npx.exe"); p != "" {
+		return p
+	}
+	if p := findOnPath("npx"); p != "" {
+		return p
+	}
+	alt := `C:\Program Files\nodejs\npx.cmd`
+	if _, err := os.Stat(alt); err == nil {
+		return alt
+	}
+	return ""
+}
+
+type dshCandidate struct {
+	path    string
+	version string
+	modTime time.Time
+}
+
+func parsePackageVersion(pkgPath string) string {
+	data, err := os.ReadFile(pkgPath)
 	if err != nil {
 		return ""
 	}
-	var cands []string
+	var p struct {
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(data, &p); err != nil {
+		return ""
+	}
+	return p.Version
+}
+
+// 语义化版本号比较 (支持 rc/beta/alpha 等预发布标签)
+// 返回: 1 (v1 > v2), -1 (v1 < v2), 0 (v1 == v2)
+func compareVersion(v1, v2 string) int {
+	v1 = strings.TrimPrefix(strings.TrimSpace(v1), "v")
+	v2 = strings.TrimPrefix(strings.TrimSpace(v2), "v")
+	if v1 == v2 {
+		return 0
+	}
+	if v1 == "" {
+		return -1
+	}
+	if v2 == "" {
+		return 1
+	}
+
+	splitPre := func(v string) (string, string) {
+		if idx := strings.Index(v, "-"); idx >= 0 {
+			return v[:idx], v[idx+1:]
+		}
+		return v, ""
+	}
+
+	main1, pre1 := splitPre(v1)
+	main2, pre2 := splitPre(v2)
+
+	parts1 := strings.Split(main1, ".")
+	parts2 := strings.Split(main2, ".")
+	maxLen := len(parts1)
+	if len(parts2) > maxLen {
+		maxLen = len(parts2)
+	}
+
+	for i := 0; i < maxLen; i++ {
+		var n1, n2 int
+		if i < len(parts1) {
+			fmt.Sscanf(parts1[i], "%d", &n1)
+		}
+		if i < len(parts2) {
+			fmt.Sscanf(parts2[i], "%d", &n2)
+		}
+		if n1 != n2 {
+			if n1 > n2 {
+				return 1
+			}
+			return -1
+		}
+	}
+
+	// 主版本相同，处理 pre-release（有 pre-release 的版本低于无 pre-release 的正式版）
+	if pre1 == "" && pre2 != "" {
+		return 1
+	}
+	if pre1 != "" && pre2 == "" {
+		return -1
+	}
+	if pre1 == pre2 {
+		return 0
+	}
+
+	preParts1 := strings.Split(pre1, ".")
+	preParts2 := strings.Split(pre2, ".")
+	maxPre := len(preParts1)
+	if len(preParts2) > maxPre {
+		maxPre = len(preParts2)
+	}
+	for i := 0; i < maxPre; i++ {
+		var p1, p2 string
+		if i < len(preParts1) {
+			p1 = preParts1[i]
+		}
+		if i < len(preParts2) {
+			p2 = preParts2[i]
+		}
+		if p1 == p2 {
+			continue
+		}
+		var num1, num2 int
+		c1, _ := fmt.Sscanf(p1, "%d", &num1)
+		c2, _ := fmt.Sscanf(p2, "%d", &num2)
+		if c1 == 1 && c2 == 1 {
+			if num1 != num2 {
+				if num1 > num2 {
+					return 1
+				}
+				return -1
+			}
+		} else {
+			if p1 > p2 {
+				return 1
+			}
+			return -1
+		}
+	}
+
+	return 0
+}
+
+func findAllBinJsCandidates() []dshCandidate {
+	var cands []dshCandidate
+	seen := make(map[string]bool)
+
+	addCand := func(jsPath string) {
+		jsPath = filepath.Clean(jsPath)
+		if seen[jsPath] {
+			return
+		}
+		fi, err := os.Stat(jsPath)
+		if err != nil || fi.IsDir() {
+			return
+		}
+		seen[jsPath] = true
+		pkgPath := filepath.Join(filepath.Dir(filepath.Dir(jsPath)), "package.json")
+		ver := parsePackageVersion(pkgPath)
+		cands = append(cands, dshCandidate{
+			path:    jsPath,
+			version: ver,
+			modTime: fi.ModTime(),
+		})
+	}
+
+	// 1. 全局 npm 路径 (如 %APPDATA%\npm\node_modules\@deepseek-ai\dsh\lib\bin.js)
+	if appData := os.Getenv("APPDATA"); appData != "" {
+		addCand(filepath.Join(appData, "npm", "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js"))
+		addCand(filepath.Join(appData, "pnpm", "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js"))
+	}
+
+	// 2. 全局 pnpm / local 路径
+	if localAppData := os.Getenv("LOCALAPPDATA"); localAppData != "" {
+		addCand(filepath.Join(localAppData, "pnpm", "global", "5", "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js"))
+	}
+
+	// 3. npx 缓存目录 (%LOCALAPPDATA%\npm-cache\_npx\*\node_modules\@deepseek-ai\dsh\lib\bin.js)
+	if localAppData := os.Getenv("LOCALAPPDATA"); localAppData != "" {
+		npxRoot := filepath.Join(localAppData, "npm-cache", "_npx")
+		if dirs, err := os.ReadDir(npxRoot); err == nil {
+			for _, d := range dirs {
+				if d.IsDir() {
+					addCand(filepath.Join(npxRoot, d.Name(), "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js"))
+				}
+			}
+		}
+	}
+
+	// 4. NodeJS 全局目录
+	addCand(`C:\Program Files\nodejs\node_modules\@deepseek-ai\dsh\lib\bin.js`)
+
+	// 5. 当前可执行文件同级目录
+	if appDir != "" {
+		addCand(filepath.Join(appDir, "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js"))
+	}
+
+	return cands
+}
+
+func findBinJs() string {
+	candidates := findAllBinJsCandidates()
+	if len(candidates) == 0 {
+		return ""
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		cmp := compareVersion(candidates[i].version, candidates[j].version)
+		if cmp != 0 {
+			return cmp > 0
+		}
+		return candidates[i].modTime.After(candidates[j].modTime)
+	})
+	return candidates[0].path
+}
+
+func getInstalledDshVersion() string {
+	bin := findBinJs()
+	if bin == "" {
+		return ""
+	}
+	pkgPath := filepath.Join(filepath.Dir(filepath.Dir(bin)), "package.json")
+	return parsePackageVersion(pkgPath)
+}
+
+func fetchLatestDshVersion() (string, error) {
+	urls := []string{
+		"https://registry.npmmirror.com/@deepseek-ai/dsh/latest",
+		"https://registry.npmjs.org/@deepseek-ai/dsh/latest",
+	}
+	client := &http.Client{Timeout: 6 * time.Second}
+	var lastErr error
+	for _, u := range urls {
+		req, err := http.NewRequest("GET", u, nil)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		req.Header.Set("User-Agent", "dsh-tiny-desktop")
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+			continue
+		}
+		var p struct {
+			Version string `json:"version"`
+		}
+		err = json.NewDecoder(resp.Body).Decode(&p)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if p.Version != "" {
+			return p.Version, nil
+		}
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("无法获取远端版本")
+	}
+	return "", lastErr
+}
+
+func cleanNpxLocks() {
+	localAppData := os.Getenv("LOCALAPPDATA")
+	if localAppData == "" {
+		return
+	}
+	npxRoot := filepath.Join(localAppData, "npm-cache", "_npx")
+	dirs, err := os.ReadDir(npxRoot)
+	if err != nil {
+		return
+	}
 	for _, d := range dirs {
 		if !d.IsDir() {
 			continue
 		}
-		js := filepath.Join(npxRoot, d.Name(), "node_modules", "@deepseek-ai", "dsh", "lib", "bin.js")
-		if _, err := os.Stat(js); err == nil {
-			cands = append(cands, js)
+		lockPath := filepath.Join(npxRoot, d.Name(), "concurrency.lock")
+		if _, err := os.Stat(lockPath); err == nil {
+			os.RemoveAll(lockPath)
+			Log("清理 npx 死锁文件: " + lockPath)
 		}
 	}
-	if len(cands) == 0 {
-		return ""
+}
+
+var (
+	updateMu   sync.Mutex
+	isUpdating bool
+)
+
+// 手动检查并更新 DSH 内核
+func updateDshKernel() {
+	updateMu.Lock()
+	if isUpdating {
+		updateMu.Unlock()
+		showToast(notifyPayload{
+			Title: "DSH 更新中",
+			Body:  "DSH 内核更新正在进行中，请稍候...",
+		})
+		return
 	}
-	sort.Slice(cands, func(i, j int) bool {
-		ti, _ := os.Stat(cands[i])
-		tj, _ := os.Stat(cands[j])
-		return ti.ModTime().After(tj.ModTime())
+	isUpdating = true
+	updateMu.Unlock()
+
+	defer func() {
+		updateMu.Lock()
+		isUpdating = false
+		updateMu.Unlock()
+	}()
+
+	currentVer := getInstalledDshVersion()
+	curText := currentVer
+	if curText == "" {
+		curText = "未知/未安装"
+	}
+	Log(fmt.Sprintf("手动检查更新: 当前本地版本 %s", curText))
+
+	showToast(notifyPayload{
+		Title: "检查 DSH 更新",
+		Body:  fmt.Sprintf("当前本地版本: %s\n正在检查远端最新版本并准备更新...", curText),
 	})
-	return cands[0]
+
+	latestVer, err := fetchLatestDshVersion()
+	if err != nil {
+		Log("获取远端最新版本提示: " + err.Error() + "，将直接执行 npm 更新")
+	} else {
+		Log(fmt.Sprintf("远端最新版本: %s", latestVer))
+		if currentVer != "" && compareVersion(currentVer, latestVer) >= 0 {
+			showToast(notifyPayload{
+				Title: "DSH 已是最新版",
+				Body:  fmt.Sprintf("当前版本 (v%s) 已是官方最新版本，无需更新。", currentVer),
+			})
+			return
+		}
+		showToast(notifyPayload{
+			Title: "正在更新 DSH 内核",
+			Body:  fmt.Sprintf("发现新版本 v%s (当前: v%s)\n正在下载安装，请稍候...", latestVer, curText),
+		})
+	}
+
+	// 1. 清理可能导致卡死的 npx lockfile
+	cleanNpxLocks()
+
+	// 2. 执行安装更新命令 (优先 npm 全局安装，其次 npx)
+	npm := findNpm()
+	var cmd *exec.Cmd
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	if npm != "" {
+		Log("使用 npm 进行全局更新: " + npm + " install -g @deepseek-ai/dsh@latest")
+		cmd = exec.CommandContext(ctx, npm, "install", "-g", "@deepseek-ai/dsh@latest")
+	} else if npx := findNpx(); npx != "" {
+		Log("使用 npx 拉取最新包: " + npx + " -y @deepseek-ai/dsh@latest --version")
+		cmd = exec.CommandContext(ctx, npx, "-y", "@deepseek-ai/dsh@latest", "--version")
+	} else {
+		Log("系统未找到 npm 或 npx 命令")
+		showToast(notifyPayload{
+			Title:              "DSH 更新失败",
+			Body:               "未在系统中找到 npm/npx，请确认已正确安装 Node.js 环境。",
+			RequireInteraction: true,
+		})
+		return
+	}
+
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000} // CREATE_NO_WINDOW
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		Log("执行更新失败: " + err.Error() + "\n输出: " + string(output))
+		showToast(notifyPayload{
+			Title:              "DSH 更新失败",
+			Body:               fmt.Sprintf("更新执行失败: %s\n可查看日志了解详情", err.Error()),
+			RequireInteraction: true,
+		})
+		return
+	}
+
+	Log("更新执行成功:\n" + string(output))
+
+	// 3. 获取更新后的版本号
+	newVer := getInstalledDshVersion()
+	if newVer == "" {
+		if latestVer != "" {
+			newVer = latestVer
+		} else {
+			newVer = "最新版"
+		}
+	}
+
+	// 4. 若 DSH 服务正在运行，自动热重启服务以应用新版本
+	if portOpen(port) || dshCmd != nil {
+		Log("DSH 服务正在运行，自动重启以应用新版本")
+		restartService()
+		showToast(notifyPayload{
+			Title: "DSH 更新完成",
+			Body:  fmt.Sprintf("DSH 内核已成功更新至 v%s！\n服务已自动重启生效。", newVer),
+		})
+	} else {
+		showToast(notifyPayload{
+			Title: "DSH 更新完成",
+			Body:  fmt.Sprintf("DSH 内核已成功更新至 v%s！", newVer),
+		})
+	}
 }
 
 // ---------- 日志 ----------

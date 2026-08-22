@@ -19,7 +19,7 @@
 - **System tray**: whale icon resident in the tray; close the window and the service keeps running
 - **Desktop notifications**: the page's `Notification` API is bridged to a **white-card toast** (bottom-right, rounded corners with a light border, crisp ClearType text; hover states and action buttons, clicking focuses the window) — plugins like `dsh-notification` work out of the box, with no browser-style permission prompt and no reliance on the OS notification pipeline (Windows 11 no longer renders legacy tray balloons). It's a plain GDI window, so it renders reliably even over remote desktop / virtual displays; opening the same UI in a real browser still uses the browser's native notifications
 - **Approve from the toast**: DSH **approval requests** (tool execution needing permission) pop up with **Allow once / Reject** buttons answered directly on the toast — no need to switch back to the window; it uses the same client-runtime response channel as the GUI (`approval/requested` → `PendingWait.respond`)
-- **Always fresh**: automatically uses the **latest** `@deepseek-ai/dsh` from your npx cache — no manual updates
+- **Smart & Manual Updates**: automatically detects and runs the highest version from global npm, pnpm, and npx cache; right-click tray menu provides one-click "**Check & Update DSH**"
 - **Memory-friendly**: closing the window destroys WebView2 (~500 MB freed); reopening rebuilds on demand
 - **Zoom**: Ctrl + scroll / Ctrl + `+` `-` to zoom the page (0.5x–2x)
 - **Single instance**: double-clicking the shortcut again just focuses the existing window
@@ -59,14 +59,15 @@ That's it — **`DSH Tray.exe` is the whole app** (icon embedded, zero external 
 | Action | Result |
 |---|---|
 | Double-click `DSH Tray.exe` / shortcut | Tray icon + native window opens |
-| Tray menu | **Open window** · **Open in browser** · **Restart service** · **Exit (stop service)** |
+| Tray menu | **Open window** · **Open in browser** · **Restart service** · **Check & Update DSH** · **Exit (stop service)** |
 | Close window | Service keeps running in tray; reopening rebuilds the window |
 | Ctrl + scroll / Ctrl + `+`/`-` | Page zoom (0.5x–2x); Ctrl+`0` resets |
 | Double-click shortcut again | Focuses the existing window (single instance) |
 
 ## 🔄 How updates work
 
-The app locates the **newest** `@deepseek-ai/dsh` CLI under your npx cache (`%LOCALAPPDATA%\npm-cache\_npx\...`) at startup — new official releases are picked up automatically, no action needed.
+- **Automatic discovery**: searches global npm, pnpm, and npx cache (`%LOCALAPPDATA%\npm-cache\_npx\...`) to pick the highest semantic version at startup;
+- **One-click manual update**: click "**Check & Update DSH**" in the tray menu to fetch and install the latest official release on demand with auto-restart, Windows lock self-healing, and native desktop notifications.
 
 ## ⚙️ Configuration & Logs
 

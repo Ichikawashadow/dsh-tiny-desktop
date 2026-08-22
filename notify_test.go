@@ -3,6 +3,8 @@ package main
 import (
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -436,5 +438,52 @@ func TestToastGeometryDpiScaling(t *testing.T) {
 		if got2 < bodyH {
 			t.Fatalf("dpi=%d 带按钮正文矩形高度 %d < 实测 %d（半截字回归）", dpi, got2, bodyH)
 		}
+	}
+}
+
+func TestCompareVersion(t *testing.T) {
+	tests := []struct {
+		v1       string
+		v2       string
+		expected int
+	}{
+		{"0.1.1-rc.2", "0.1.0-rc.8", 1},
+		{"0.1.0-rc.8", "0.1.1-rc.2", -1},
+		{"0.1.1-rc.2", "0.1.1-rc.2", 0},
+		{"v0.1.1-rc.2", "0.1.1-rc.2", 0},
+		{"0.1.1", "0.1.1-rc.2", 1},
+		{"0.1.1-rc.2", "0.1.1", -1},
+		{"0.1.1-rc.10", "0.1.1-rc.2", 1},
+		{"0.1.1-rc.2", "0.1.1-rc.10", -1},
+		{"1.0.0", "0.9.9", 1},
+		{"0.9.9", "1.0.0", -1},
+		{"", "0.1.0", -1},
+		{"0.1.0", "", 1},
+		{"", "", 0},
+	}
+
+	for _, tt := range tests {
+		got := compareVersion(tt.v1, tt.v2)
+		if got != tt.expected {
+			t.Errorf("compareVersion(%q, %q) = %d; want %d", tt.v1, tt.v2, got, tt.expected)
+		}
+	}
+}
+
+func TestParsePackageVersion(t *testing.T) {
+	tmpDir := t.TempDir()
+	pkgFile := filepath.Join(tmpDir, "package.json")
+	if err := os.WriteFile(pkgFile, []byte(`{"name":"@deepseek-ai/dsh","version":"0.1.1-rc.2"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	ver := parsePackageVersion(pkgFile)
+	if ver != "0.1.1-rc.2" {
+		t.Errorf("parsePackageVersion = %q; want 0.1.1-rc.2", ver)
+	}
+
+	// 不存在的文件返回空
+	if ver2 := parsePackageVersion(filepath.Join(tmpDir, "nonexistent.json")); ver2 != "" {
+		t.Errorf("parsePackageVersion nonexistent = %q; want empty string", ver2)
 	}
 }

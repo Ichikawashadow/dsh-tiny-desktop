@@ -21,9 +21,11 @@ try {
     go build -ldflags "-H windowsgui" -o "$root\DSH Tray.exe" .
     if ($LASTEXITCODE -ne 0) { Write-Host "编译失败"; exit 1 }
 
+    Copy-Item "$root\DSH Tray.exe" "$root\DSH.Tray.exe" -Force
+
     $size = [math]::Round((Get-Item "$root\DSH Tray.exe").Length / 1MB, 1)
     Write-Host ""
-    Write-Host "✅ 构建完成: DSH Tray.exe ($size MB)"
+    Write-Host "构建完成: DSH Tray.exe ($size MB)"
     Write-Host "部署: 复制 DSH Tray.exe 到任意目录，双击运行即可。"
 }
 finally {
