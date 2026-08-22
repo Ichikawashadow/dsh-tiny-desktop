@@ -1,6 +1,7 @@
 # 构建产物
 DSH Tray.exe
 *.exe
+*.zip
 rsrc.syso
 
 # 系统文件
